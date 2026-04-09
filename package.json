@@ -1,0 +1,91 @@
+{
+  "name": "cursor-usage-monitor",
+  "displayName": "Cursor Usage Monitor",
+  "description": "在 Cursor 中实时展示 Included Usage 和 On-Demand Usage 用量信息",
+  "version": "0.2.0",
+  "publisher": "cursor-usage-monitor",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cursorUsageMonitor.refresh",
+        "title": "Cursor Usage: 刷新用量",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cursorUsageMonitor.setToken",
+        "title": "Cursor Usage: 设置 Token"
+      },
+      {
+        "command": "cursorUsageMonitor.setThreshold",
+        "title": "Cursor Usage: 设置告警阈值"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cursorUsageMonitor",
+          "title": "Cursor Usage",
+          "icon": "$(dashboard)"
+        }
+      ]
+    },
+    "views": {
+      "cursorUsageMonitor": [
+        {
+          "id": "cursorUsageView",
+          "name": "用量概览"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "cursorUsageMonitor.refresh",
+          "when": "view == cursorUsageView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Cursor Usage Monitor",
+      "properties": {
+        "cursorUsageMonitor.refreshInterval": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 60,
+          "description": "自动刷新间隔（分钟）"
+        },
+        "cursorUsageMonitor.warningThreshold": {
+          "type": "number",
+          "default": 85,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "用量告警阈值（百分比），超过此值状态栏显示橙色警告"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
