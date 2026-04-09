@@ -4,6 +4,10 @@
   "description": "在 Cursor 中实时展示 Included Usage 和 On-Demand Usage 用量信息",
   "version": "0.2.0",
   "publisher": "cursor-usage-monitor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pittttt/cursor-usage-monitor"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },

@@ -70,6 +70,8 @@ export class UsageStatusBarItem {
           ? `$(calendar) **Resets**: ${new Date(data.billingEnd).toLocaleDateString("zh-CN")}（${this.daysUntil(data.billingEnd)} 天后重置）`
           : "",
         "",
+        this.buildDashboardLink(),
+        "",
         `_更新于 ${data.updatedAt.toLocaleTimeString("zh-CN")}_`,
         "",
         "_点击刷新_",
@@ -96,6 +98,15 @@ export class UsageStatusBarItem {
     this.item.backgroundColor = new vscode.ThemeColor(
       "statusBarItem.warningBackground"
     );
+  }
+
+  private buildDashboardLink(): string {
+    const to = new Date();
+    const from = new Date(to);
+    from.setDate(from.getDate() - 30);
+    const toDate = to.toISOString().slice(0, 10);
+    const fromDate = from.toISOString().slice(0, 10);
+    return `$(link-external) [查看用量明细](https://cursor.com/cn/dashboard/usage?from=${fromDate}&to=${toDate})`;
   }
 
   private daysUntil(dateStr: string): number {
