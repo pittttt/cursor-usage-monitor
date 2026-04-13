@@ -26,14 +26,13 @@ export class UsageStatusBarItem {
   }
 
   setData(data: CombinedUsageData): void {
-    const total = data.totalUsageDollars.toFixed(2);
-    const onDemand = data.onDemandUsageDollars.toFixed(2);
-    const included = data.includedUsageDollars.toFixed(2);
+    const used = data.monthlyUsageDollars.toFixed(2);
+    const limit = data.monthlyLimitDollars.toFixed(2);
     const percent = data.usagePercent;
     const threshold = this.getThreshold();
     const overThreshold = percent >= threshold;
 
-    this.item.text = `$(dashboard) $${total}`;
+    this.item.text = `$(dashboard) $${used}`;
     this.item.command = "cursorUsageMonitor.refresh";
 
     if (overThreshold) {
@@ -46,21 +45,16 @@ export class UsageStatusBarItem {
 
     const statusIcon = overThreshold ? "$(warning)" : "$(pass)";
     const statusEmoji = overThreshold ? "⚠️" : "✅";
-    const totalLimit = data.totalLimitDollars.toFixed(2);
-    const includedLimit = data.includedLimitDollars.toFixed(2);
-    const onDemandLimit = data.onDemandLimitDollars.toFixed(2);
 
     const tooltip = new vscode.MarkdownString(
       [
         "**Cursor Usage Monitor**",
         "",
-        `${statusIcon} **使用率**: ${percent.toFixed(1)}% ${statusEmoji}  ($${total} / $${totalLimit})`,
+        `${statusIcon} **使用率**: ${percent.toFixed(1)}% ${statusEmoji}  ($${used} / $${limit})`,
         "",
         `---`,
         "",
-        `$(package) **Your Included Usage**: $${included} / $${includedLimit}`,
-        "",
-        `$(flame) **On-Demand Usage**: $${onDemand} / $${onDemandLimit}`,
+        `$(package) **Your Monthly Usage**: $${used} / $${limit}`,
         "",
         `---`,
         "",

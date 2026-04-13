@@ -72,34 +72,12 @@ export class UsageTreeDataProvider
 
     const items: UsageTreeItem[] = [];
 
-    const totalItem = this.makeItem(
-      `$(graph) 总用量: $${this.data.totalUsageDollars.toFixed(2)}`,
+    const usageItem = this.makeItem(
+      `$(package) Your Monthly Usage: $${this.data.monthlyUsageDollars.toFixed(2)} / $${this.data.monthlyLimitDollars.toFixed(2)}`,
       vscode.TreeItemCollapsibleState.None
     );
-    totalItem.description = "Included + On-Demand";
-    items.push(totalItem);
-
-    items.push(this.makeSeparator());
-
-    const includedItem = this.makeItem(
-      `$(package) Your Included Usage: $${this.data.includedUsageDollars.toFixed(2)}`,
-      vscode.TreeItemCollapsibleState.None
-    );
-    includedItem.description = "套餐内用量";
-    items.push(includedItem);
-
-    const onDemandItem = this.makeItem(
-      `$(flame) On-Demand Usage: $${this.data.onDemandUsageDollars.toFixed(2)}`,
-      vscode.TreeItemCollapsibleState.None
-    );
-    onDemandItem.description = "按需用量";
-    if (this.data.onDemandUsageDollars > 0) {
-      onDemandItem.iconPath = new vscode.ThemeIcon(
-        "flame",
-        new vscode.ThemeColor("charts.orange")
-      );
-    }
-    items.push(onDemandItem);
+    usageItem.description = `${this.data.usagePercent.toFixed(1)}%`;
+    items.push(usageItem);
 
     items.push(this.makeSeparator());
 
