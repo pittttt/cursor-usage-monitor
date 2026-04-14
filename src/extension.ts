@@ -1,11 +1,18 @@
 import * as vscode from "vscode";
-import { getValidAccessToken, fetchCoreUsage, fetchSupplementalUsage, initCacheDir } from "./api";
+import { getValidAccessToken, fetchCoreUsage, fetchSupplementalUsage, initCacheDir, isBlocked } from "./api";
 import { UsageStatusBarItem } from "./statusBar";
 import { UsageTreeDataProvider } from "./usageView";
 
 let statusBarItem: UsageStatusBarItem | undefined;
 let treeDataProvider: UsageTreeDataProvider | undefined;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
+let currentIntervalMs = 0;
+const BLOCKED_INTERVAL_MS = 60 * 60 * 1000; // 封锁时 60 分钟
+
+function getConfigIntervalMs(): number {
+  const config = vscode.workspace.getConfiguration("cursorUsageMonitor");
+  return config.get<number>("refreshInterval", 30) * 60 * 1000;
+}
 
 async function refresh(): Promise<void> {
   const auth = getValidAccessToken();
@@ -24,11 +31,16 @@ async function refresh(): Promise<void> {
     statusBarItem?.setData(coreData);
     treeDataProvider?.setData(coreData);
 
-    // Background: fetch invoice items
     fetchSupplementalUsage(auth.sessionCookie, coreData).then((fullData) => {
       statusBarItem?.setData(fullData);
       treeDataProvider?.setData(fullData);
     }).catch(() => {});
+
+    // 封锁状态变化时自动调整刷新间隔
+    const desiredMs = isBlocked() ? BLOCKED_INTERVAL_MS : getConfigIntervalMs();
+    if (desiredMs !== currentIntervalMs) {
+      startAutoRefresh(desiredMs);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     statusBarItem?.setError(message);
@@ -36,16 +48,13 @@ async function refresh(): Promise<void> {
   }
 }
 
-function startAutoRefresh(): void {
+function startAutoRefresh(intervalMs?: number): void {
   stopAutoRefresh();
-
-  const config = vscode.workspace.getConfiguration("cursorUsageMonitor");
-  const intervalMinutes = config.get<number>("refreshInterval", 5);
-  const intervalMs = intervalMinutes * 60 * 1000;
+  currentIntervalMs = intervalMs ?? getConfigIntervalMs();
 
   refreshTimer = setInterval(() => {
     refresh();
-  }, intervalMs);
+  }, currentIntervalMs);
 }
 
 function stopAutoRefresh(): void {

@@ -66,10 +66,10 @@
       "properties": {
         "cursorUsageMonitor.refreshInterval": {
           "type": "number",
-          "default": 5,
+          "default": 30,
           "minimum": 1,
-          "maximum": 60,
-          "description": "自动刷新间隔（分钟）"
+          "maximum": 120,
+          "description": "自动刷新间隔（分钟），API 封锁时自动延长至 60 分钟"
         },
         "cursorUsageMonitor.warningThreshold": {
           "type": "number",

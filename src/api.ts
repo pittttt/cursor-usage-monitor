@@ -249,6 +249,11 @@ function saveCacheToDisk(data: CombinedUsageData): void {
   }
 }
 
+let lastFetchBlocked = false;
+export function isBlocked(): boolean {
+  return lastFetchBlocked;
+}
+
 // ---- Core fetch ----
 
 function parseSummary(summary: UsageSummary): CombinedUsageData {
@@ -335,13 +340,16 @@ export async function fetchCoreUsage(
     }
     cachedData = result;
     saveCacheToDisk(result);
+    lastFetchBlocked = false;
     log(`结果: $${result.monthlyUsageDollars}/$${result.monthlyLimitDollars} (${result.usagePercent.toFixed(1)}%)`);
     return result;
   }
 
+  lastFetchBlocked = true;
+
   // API 失败：优先使用缓存，补充最新 reset 时间
   if (cachedData) {
-    log("[summary] API 不可用，使用缓存数据（上次更新: " +
+    log("[summary] API 不可用（疑似封锁），使用缓存数据（上次更新: " +
       cachedData.updatedAt.toLocaleTimeString("zh-CN") + "）");
     return {
       ...cachedData,
