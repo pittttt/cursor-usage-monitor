@@ -1,12 +1,12 @@
-import * as https from "https";
 import * as vscode from "vscode";
+import { execSync } from "child_process";
+import * as path from "path";
+import * as os from "os";
+import * as fs from "fs";
 
 export interface CombinedUsageData {
-  /** Monthly usage in dollars */
   monthlyUsageDollars: number;
-  /** Monthly usage limit in dollars */
   monthlyLimitDollars: number;
-  /** Usage percentage: monthlyUsageDollars / monthlyLimitDollars * 100 */
   usagePercent: number;
   premiumRequestsUsed: number;
   premiumRequestsLimit: number;
@@ -29,376 +29,374 @@ function log(message: string): void {
   getOutputChannel().appendLine(`[${new Date().toLocaleTimeString("zh-CN")}] ${message}`);
 }
 
-function httpsRequest(
-  url: string,
-  token: string,
-  method: "GET" | "POST" = "GET",
-  body?: Record<string, unknown>,
-  maxRedirects = 5
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const options: https.RequestOptions = {
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname + parsedUrl.search,
-      method,
+// ---- Auth ----
+
+function getStateDbPath(): string {
+  const platform = process.platform;
+  if (platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb");
+  } else if (platform === "win32") {
+    return path.join(process.env.APPDATA || "", "Cursor", "User", "globalStorage", "state.vscdb");
+  }
+  return path.join(os.homedir(), ".config", "Cursor", "User", "globalStorage", "state.vscdb");
+}
+
+function readDbKey(key: string): string | null {
+  const dbPath = getStateDbPath();
+  if (!fs.existsSync(dbPath)) {
+    return null;
+  }
+  try {
+    return execSync(
+      `sqlite3 "${dbPath}" "SELECT value FROM ItemTable WHERE key = '${key}' LIMIT 1"`,
+      { encoding: "utf-8", timeout: 5000 }
+    ).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function extractUserIdFromJwt(jwt: string): string {
+  try {
+    const payload = jwt.split(".")[1];
+    let padded = payload;
+    while (padded.length % 4 !== 0) {
+      padded += "=";
+    }
+    const decoded = JSON.parse(Buffer.from(padded, "base64").toString("utf-8"));
+    const sub = decoded.sub as string;
+    const parts = sub.split("|");
+    return parts[parts.length - 1];
+  } catch {
+    return "";
+  }
+}
+
+function getJwtExpiry(jwt: string): Date | null {
+  try {
+    const payload = jwt.split(".")[1];
+    let padded = payload;
+    while (padded.length % 4 !== 0) {
+      padded += "=";
+    }
+    const decoded = JSON.parse(Buffer.from(padded, "base64").toString("utf-8"));
+    return decoded.exp ? new Date(decoded.exp * 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getValidAccessToken(): { jwt: string; sessionCookie: string } | null {
+  const accessToken = readDbKey("cursorAuth/accessToken");
+  if (!accessToken) {
+    log("[auth] 无法读取 access token");
+    return null;
+  }
+
+  const expiry = getJwtExpiry(accessToken);
+  if (expiry && expiry.getTime() < Date.now()) {
+    log(`[auth] Token 已过期 (${expiry.toLocaleDateString("zh-CN")})，等待 Cursor 自动刷新...`);
+    vscode.window.showWarningMessage(
+      "Cursor Usage Monitor: Token 已过期，请重启 Cursor 或重新登录以刷新 Token。"
+    );
+    return null;
+  }
+
+  if (expiry) {
+    const daysLeft = Math.ceil((expiry.getTime() - Date.now()) / 86400000);
+    log(`[auth] Token 有效期至 ${expiry.toLocaleDateString("zh-CN")}（剩余 ${daysLeft} 天）`);
+  }
+
+  const userId = extractUserIdFromJwt(accessToken);
+  if (!userId) {
+    log("[auth] 无法从 token 中提取 userId");
+    return null;
+  }
+
+  const sessionCookie = `WorkosCursorSessionToken=${userId}::${accessToken}`;
+  log(`[auth] userId: ${userId.substring(0, 12)}...`);
+  return { jwt: accessToken, sessionCookie };
+}
+
+// ---- Fetch helpers ----
+
+async function fetchJson<T>(url: string, cookie: string, timeoutMs = 8000): Promise<T | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch(url, {
       headers: {
+        Cookie: cookie,
         "Content-Type": "application/json",
-        Cookie: `WorkosCursorSessionToken=${token}`,
-        Origin: "https://cursor.com",
-        Referer: "https://cursor.com/dashboard",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "*/*",
-        "Accept-Language": "en",
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
       },
-    };
-
-    const req = https.request(options, (res) => {
-      // HTTP-level redirect (301, 302, 307, 308)
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        if (maxRedirects <= 0) {
-          reject(new Error("重定向次数过多"));
-          return;
-        }
-        log(`HTTP ${res.statusCode} 重定向: ${res.headers.location}`);
-        res.resume();
-        httpsRequest(res.headers.location, token, method, body, maxRedirects - 1)
-          .then(resolve)
-          .catch(reject);
-        return;
-      }
-
-      let data = "";
-      res.on("data", (chunk: Buffer) => {
-        data += chunk.toString();
-      });
-      res.on("end", () => {
-        if (res.statusCode && res.statusCode >= 400) {
-          reject(
-            new Error(`API 状态码 ${res.statusCode}: ${data}`)
-          );
-          return;
-        }
-
-        // Handle Cursor's JSON-body redirect
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.redirect && (parsed.status === "308" || parsed.status === 308)) {
-            if (maxRedirects <= 0) {
-              reject(new Error("重定向次数过多"));
-              return;
-            }
-            log(`JSON 重定向: ${parsed.redirect}`);
-            httpsRequest(parsed.redirect, token, method, body, maxRedirects - 1)
-              .then(resolve)
-              .catch(reject);
-            return;
-          }
-        } catch {
-          // not JSON, continue normally
-        }
-
-        resolve(data);
-      });
+      signal: controller.signal,
     });
 
-    req.on("error", (err) => reject(new Error(`网络请求失败: ${err.message}`)));
-    req.setTimeout(15000, () => {
-      req.destroy(new Error("请求超时"));
+    if (!resp.ok) {
+      log(`[fetch] ${url} → ${resp.status}`);
+      return null;
+    }
+
+    const text = await resp.text();
+    if (text.includes("Vercel Security Checkpoint") || text.includes("<!DOCTYPE html>")) {
+      log(`[fetch] ${url} → Vercel checkpoint blocked`);
+      return null;
+    }
+
+    return JSON.parse(text) as T;
+  } catch (err) {
+    log(`[fetch] ${url} → ${err instanceof Error ? err.message : err}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchJsonBearer<T>(url: string, jwt: string, method = "GET", body?: unknown, timeoutMs = 8000): Promise<T | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${jwt}`,
+    "Content-Type": "application/json",
+  };
+  if (method === "POST") {
+    headers["Connect-Protocol-Version"] = "1";
+  }
+
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
     });
 
-    if (body) {
-      req.write(JSON.stringify(body));
+    if (!resp.ok) {
+      log(`[fetch] ${url} → ${resp.status}`);
+      return null;
     }
-    req.end();
-  });
+
+    return (await resp.json()) as T;
+  } catch (err) {
+    log(`[fetch] ${url} → ${err instanceof Error ? err.message : err}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function extractUserId(token: string): string {
-  const decoded = decodeURIComponent(token);
-  const separatorIndex = decoded.indexOf("::");
-  if (separatorIndex > 0) {
-    return decoded.substring(0, separatorIndex);
-  }
-  return token.split("%3A%3A")[0] || token;
+// ---- Types ----
+
+interface UsageSummary {
+  billingCycleStart?: string;
+  billingCycleEnd?: string;
+  membershipType?: string;
+  individualUsage?: {
+    overall?: { enabled?: boolean; used?: number; limit?: number };
+    onDemand?: { enabled?: boolean; used?: number; limit?: number };
+    plan?: { used?: number; limit?: number; breakdown?: { total?: number } };
+  };
+  teamUsage?: Record<string, unknown>;
 }
 
-export async function fetchCombinedUsage(
-  token: string
-): Promise<CombinedUsageData> {
-  const userId = extractUserId(token);
-  log(`userId: ${userId.substring(0, 12)}...`);
+interface PlanInfo {
+  planInfo?: {
+    planName?: string;
+    price?: string;
+    billingCycleEnd?: string;
+  };
+}
 
-  const now = new Date();
-  const currentMonth = now.getMonth() + 1;
-  const currentYear = now.getFullYear();
+// ---- Disk cache ----
 
-  // Fetch all APIs in parallel
-  const [usageBody, invoiceBody, summaryBody, hardLimitBody] = await Promise.all([
-    httpsRequest(
-      `https://cursor.com/api/usage?user=${encodeURIComponent(userId)}`,
-      token
-    ).catch((err) => {
-      log(`[usage] 失败: ${err.message}`);
-      return null;
-    }),
-    httpsRequest(
-      "https://cursor.com/api/dashboard/get-monthly-invoice",
-      token,
-      "POST",
-      { month: currentMonth, year: currentYear, includeUsageEvents: false }
-    ).catch((err) => {
-      log(`[invoice] 失败: ${err.message}`);
-      return null;
-    }),
-    httpsRequest(
-      "https://cursor.com/api/usage-summary",
-      token
-    ).catch((err) => {
-      log(`[summary] 失败: ${err.message}`);
-      return null;
-    }),
-    httpsRequest(
-      "https://cursor.com/api/dashboard/get-hard-limit",
-      token,
-      "POST",
-      {}
-    ).catch((err) => {
-      log(`[hard-limit] 失败: ${err.message}`);
-      return null;
-    }),
-  ]);
+let cachedData: CombinedUsageData | null = null;
+let cacheFilePath: string | undefined;
 
-  log(`[usage] 响应: ${usageBody ?? "null"}`);
-  log(`[invoice] 响应: ${invoiceBody ?? "null"}`);
-  log(`[summary] 响应: ${summaryBody ?? "null"}`);
-  log(`[hard-limit] 响应: ${hardLimitBody ?? "null"}`);
-
-  // --- Parse usage (request counts) ---
-  let premiumUsed = 0;
-  let premiumLimit = 500;
-  let billingStart = "";
-
-  if (usageBody) {
-    try {
-      const usage = JSON.parse(usageBody);
-      const gpt4 = usage["gpt-4"] ?? {};
-      premiumUsed = gpt4.numRequests ?? 0;
-      premiumLimit = gpt4.maxRequestUsage ?? 500;
-      billingStart = usage.startOfMonth ?? "";
-      log(`[usage] 解析: requests=${premiumUsed}/${premiumLimit}, start=${billingStart}`);
-    } catch (err) {
-      log(`[usage] JSON 解析失败: ${err}`);
-    }
+export function initCacheDir(storagePath: string): void {
+  if (!fs.existsSync(storagePath)) {
+    fs.mkdirSync(storagePath, { recursive: true });
   }
+  cacheFilePath = path.join(storagePath, "usage-cache.json");
+  loadCacheFromDisk();
+}
 
-  // --- Parse usage-summary ---
+function loadCacheFromDisk(): void {
+  if (!cacheFilePath || !fs.existsSync(cacheFilePath)) {
+    return;
+  }
+  try {
+    const raw = fs.readFileSync(cacheFilePath, "utf-8");
+    const obj = JSON.parse(raw);
+    obj.updatedAt = new Date(obj.updatedAt);
+    cachedData = obj as CombinedUsageData;
+    log(`[cache] 从磁盘加载缓存 (${cachedData.updatedAt.toLocaleString("zh-CN")})`);
+  } catch {
+    log("[cache] 读取磁盘缓存失败");
+  }
+}
+
+function saveCacheToDisk(data: CombinedUsageData): void {
+  if (!cacheFilePath) {
+    return;
+  }
+  try {
+    fs.writeFileSync(cacheFilePath, JSON.stringify(data), "utf-8");
+    log("[cache] 已写入磁盘缓存");
+  } catch {
+    log("[cache] 写入磁盘缓存失败");
+  }
+}
+
+// ---- Core fetch ----
+
+function parseSummary(summary: UsageSummary): CombinedUsageData {
   let monthlyUsageDollars = 0;
   let monthlyLimitDollars = 0;
-  let billingEnd: string | undefined;
 
-  if (summaryBody) {
-    try {
-      const summary = JSON.parse(summaryBody);
+  const billingStart = summary.billingCycleStart ?? "";
+  const billingEnd = summary.billingCycleEnd ?? undefined;
 
-      // Log all top-level keys for debugging
-      const topKeys = Object.keys(summary);
-      log(`[summary] 顶层字段: ${JSON.stringify(topKeys)}`);
-      for (const key of topKeys) {
-        const val = summary[key];
-        const str = typeof val === "object" ? JSON.stringify(val) : String(val);
-        log(`[summary] ${key}: ${str.substring(0, 500)}`);
+  const individual = summary.individualUsage;
+  if (individual) {
+    if (individual.overall && individual.overall.enabled) {
+      monthlyUsageDollars = (individual.overall.used ?? 0) / 100;
+      monthlyLimitDollars = (individual.overall.limit ?? 0) / 100;
+      log(`[summary] overall: $${monthlyUsageDollars}/$${monthlyLimitDollars}`);
+    }
+
+    if (monthlyUsageDollars === 0 && individual.onDemand && individual.onDemand.enabled) {
+      monthlyUsageDollars = (individual.onDemand.used ?? 0) / 100;
+      if (monthlyLimitDollars === 0) {
+        monthlyLimitDollars = (individual.onDemand.limit ?? 0) / 100;
       }
+      log(`[summary] onDemand: $${monthlyUsageDollars}/$${monthlyLimitDollars}`);
+    }
 
-      billingStart = billingStart || summary.billingCycleStart || summary.startOfMonth || "";
-      billingEnd = summary.billingCycleEnd || summary.endOfMonth;
-
-      // --- Strategy 1: New unified monthly usage format ---
-      // Try top-level fields like monthlyUsage, usage, usedAmount, etc.
-      const usedCandidates = [
-        summary.monthlyUsage?.used,
-        summary.usage?.used,
-        summary.usedAmount,
-        summary.used,
-        summary.totalUsed,
-        summary.currentUsage,
-      ];
-      const limitCandidates = [
-        summary.monthlyUsage?.limit,
-        summary.monthlyUsage?.budget,
-        summary.usage?.limit,
-        summary.usage?.budget,
-        summary.limit,
-        summary.budget,
-        summary.totalLimit,
-        summary.monthlyBudget,
-      ];
-
-      for (const v of usedCandidates) {
-        if (typeof v === "number" && v > 0) {
-          monthlyUsageDollars = v > 100 ? v / 100 : v;
-          log(`[summary] 从顶层候选字段找到 used: ${v}`);
-          break;
-        }
+    if (monthlyUsageDollars === 0 && individual.plan) {
+      monthlyUsageDollars = (individual.plan.used ?? 0) / 100;
+      if (monthlyLimitDollars === 0) {
+        monthlyLimitDollars = (individual.plan.limit ?? individual.plan.breakdown?.total ?? 0) / 100;
       }
-      for (const v of limitCandidates) {
-        if (typeof v === "number" && v > 0) {
-          monthlyLimitDollars = v > 100 ? v / 100 : v;
-          log(`[summary] 从顶层候选字段找到 limit: ${v}`);
-          break;
-        }
-      }
-
-      // --- Strategy 2: individualUsage ---
-      const individual = summary.individualUsage;
-      if (individual && monthlyUsageDollars === 0) {
-        const iKeys = Object.keys(individual);
-        log(`[summary] individualUsage 字段: ${JSON.stringify(iKeys)}`);
-        for (const key of iKeys) {
-          log(`[summary] individualUsage.${key}: ${JSON.stringify(individual[key])}`);
-        }
-
-        // New format: individualUsage.overall (2026+)
-        if (individual.overall) {
-          const usedCents = individual.overall.used ?? 0;
-          const limitCents = individual.overall.limit ?? 0;
-          monthlyUsageDollars = usedCents / 100;
-          monthlyLimitDollars = limitCents / 100;
-          log(`[summary] individualUsage.overall: used=$${monthlyUsageDollars}, limit=$${monthlyLimitDollars}`);
-        }
-
-        // Fallback: direct used/limit on individualUsage
-        if (monthlyUsageDollars === 0 && (individual.used !== undefined || individual.limit !== undefined)) {
-          const usedCents = individual.used ?? 0;
-          const limitCents = individual.limit ?? 0;
-          monthlyUsageDollars = usedCents > 100 ? usedCents / 100 : usedCents;
-          monthlyLimitDollars = limitCents > 100 ? limitCents / 100 : limitCents;
-          log(`[summary] individualUsage 直接字段: used=$${monthlyUsageDollars}, limit=$${monthlyLimitDollars}`);
-        }
-
-        // Old plan-based format
-        if (monthlyUsageDollars === 0 && individual.plan) {
-          const planUsedCents = individual.plan.used ?? 0;
-          const breakdown = individual.plan.breakdown;
-          monthlyUsageDollars = planUsedCents / 100;
-          monthlyLimitDollars = (individual.plan.limit ?? breakdown?.included ?? 0) / 100;
-
-          if (individual.onDemand) {
-            monthlyUsageDollars += (individual.onDemand.used ?? 0) / 100;
-          }
-          if (individual.usageBased) {
-            if ((individual.onDemand?.used ?? 0) === 0) {
-              monthlyUsageDollars += (individual.usageBased.used ?? 0) / 100;
-            }
-          }
-        }
-      }
-
-      // --- Strategy 3: teamUsage ---
-      const team = summary.teamUsage;
-      if (team) {
-        log(`[summary] teamUsage: ${JSON.stringify(team)}`);
-        if (monthlyUsageDollars === 0 && team.used !== undefined) {
-          monthlyUsageDollars = team.used > 100 ? team.used / 100 : team.used;
-          monthlyLimitDollars = (team.limit ?? team.budget ?? 0);
-          if (monthlyLimitDollars > 100) {
-            monthlyLimitDollars = monthlyLimitDollars / 100;
-          }
-        }
-      }
-
-      // --- Strategy 4: Fallback old top-level ---
-      if (monthlyUsageDollars === 0) {
-        const rawIncluded = summary.includedUsage ?? summary.planUsage ?? 0;
-        const rawOnDemand = summary.onDemandUsage ?? summary.additionalUsage ?? 0;
-        const inc = rawIncluded > 100 ? rawIncluded / 100 : rawIncluded;
-        const ond = rawOnDemand > 100 ? rawOnDemand / 100 : rawOnDemand;
-        monthlyUsageDollars = inc + ond;
-      }
-
-      log(`[summary] 解析: usage=$${monthlyUsageDollars}, limit=$${monthlyLimitDollars}`);
-    } catch (err) {
-      log(`[summary] JSON 解析失败: ${err}`);
+      log(`[summary] plan: $${monthlyUsageDollars}/$${monthlyLimitDollars}`);
     }
   }
 
-  // Override limit from hard-limit API if we still don't have one
-  if (hardLimitBody && monthlyLimitDollars === 0) {
-    try {
-      const hardLimit = JSON.parse(hardLimitBody);
-      log(`[hard-limit] 响应: ${JSON.stringify(hardLimit)}`);
-      const apiLimit = hardLimit.hardLimit ?? hardLimit.limit ?? 0;
-      if (apiLimit > 0) {
-        monthlyLimitDollars = apiLimit;
-      }
-    } catch (err) {
-      log(`[hard-limit] JSON 解析失败: ${err}`);
-    }
-  }
-
-  // --- Parse monthly invoice (fallback + detail) ---
-  const invoiceItems: Array<{ description: string; dollars: number }> = [];
-
-  if (invoiceBody) {
-    try {
-      const invoice = JSON.parse(invoiceBody);
-
-      // Use periodStartMs as the reset date (matches dashboard "Resets" exactly)
-      const periodStartMs = Number(invoice.periodStartMs);
-      if (periodStartMs > 0) {
-        const resetDate = new Date(periodStartMs);
-        billingEnd = resetDate.toISOString();
-        log(`[invoice] periodStartMs=${periodStartMs} → billingEnd=${billingEnd}`);
-      }
-
-      let totalInvoiceCents = 0;
-      if (invoice.items && Array.isArray(invoice.items)) {
-        for (const item of invoice.items) {
-          if (typeof item.cents !== "number") {
-            continue;
-          }
-          if (item.description?.includes("Mid-month usage paid")) {
-            continue;
-          }
-          invoiceItems.push({
-            description: item.description ?? "",
-            dollars: item.cents / 100,
-          });
-          totalInvoiceCents += item.cents;
-        }
-      }
-
-      if (monthlyUsageDollars === 0 && totalInvoiceCents > 0) {
-        monthlyUsageDollars = totalInvoiceCents / 100;
-        log(`[invoice] 使用 invoice 作为 monthlyUsage: $${monthlyUsageDollars}`);
-      }
-    } catch (err) {
-      log(`[invoice] JSON 解析失败: ${err}`);
-    }
-  }
-
-  // --- Calculate percentage ---
-  const usagePercent = monthlyLimitDollars > 0
-    ? (monthlyUsageDollars / monthlyLimitDollars) * 100
-    : 0;
-
-  log(`最终结果: usage=$${monthlyUsageDollars}/$${monthlyLimitDollars} (${usagePercent.toFixed(1)}%)`);
+  const usagePercent = monthlyLimitDollars > 0 ? (monthlyUsageDollars / monthlyLimitDollars) * 100 : 0;
 
   return {
     monthlyUsageDollars,
     monthlyLimitDollars,
     usagePercent,
-    premiumRequestsUsed: premiumUsed,
-    premiumRequestsLimit: premiumLimit,
+    premiumRequestsUsed: 0,
+    premiumRequestsLimit: 0,
     billingStart,
     billingEnd,
-    invoiceItems,
+    invoiceItems: [],
+    updatedAt: new Date(),
+  };
+}
+
+export async function fetchCoreUsage(
+  jwt: string,
+  sessionCookie: string
+): Promise<CombinedUsageData> {
+  log("[fetch] 开始获取数据...");
+
+  // 始终并行获取 GetPlanInfo（用于 reset 时间，该接口稳定可用）
+  const [summary, planInfo] = await Promise.all([
+    fetchJson<UsageSummary>(
+      "https://cursor.com/api/usage-summary",
+      sessionCookie
+    ),
+    fetchJsonBearer<PlanInfo>(
+      "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo",
+      jwt, "POST", {}
+    ),
+  ]);
+
+  // Reset 时间：usage-summary 可用时用真实值，否则用下月1号
+  let fallbackBillingEnd: string;
+  const now = new Date();
+  const nextMonth1st = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  fallbackBillingEnd = nextMonth1st.toISOString();
+
+  if (planInfo?.planInfo) {
+    log(`[planInfo] ${planInfo.planInfo.planName}`);
+  }
+
+  if (summary) {
+    log(`[summary] 成功: ${JSON.stringify(summary).substring(0, 600)}`);
+    const result = parseSummary(summary);
+    if (!result.billingEnd) {
+      result.billingEnd = fallbackBillingEnd;
+    }
+    cachedData = result;
+    saveCacheToDisk(result);
+    log(`结果: $${result.monthlyUsageDollars}/$${result.monthlyLimitDollars} (${result.usagePercent.toFixed(1)}%)`);
+    return result;
+  }
+
+  // API 失败：优先使用缓存，补充最新 reset 时间
+  if (cachedData) {
+    log("[summary] API 不可用，使用缓存数据（上次更新: " +
+      cachedData.updatedAt.toLocaleTimeString("zh-CN") + "）");
+    return {
+      ...cachedData,
+      billingEnd: cachedData.billingEnd ?? fallbackBillingEnd,
+      updatedAt: cachedData.updatedAt,
+    };
+  }
+
+  // 无缓存：只显示 reset 时间
+  log("[summary] API 不可用且无缓存");
+  return {
+    monthlyUsageDollars: 0,
+    monthlyLimitDollars: 0,
+    usagePercent: 0,
+    premiumRequestsUsed: 0,
+    premiumRequestsLimit: 0,
+    billingStart: "",
+    billingEnd: fallbackBillingEnd,
+    invoiceItems: [],
+    updatedAt: new Date(),
+  };
+}
+
+// Phase 2: invoice items (background)
+export async function fetchSupplementalUsage(
+  sessionCookie: string,
+  existing: CombinedUsageData
+): Promise<CombinedUsageData> {
+  const now = new Date();
+  log("[phase2] 获取账单明细...");
+
+  const invoice = await fetchJson<{ items?: Array<{ description?: string; cents?: number }> }>(
+    "https://cursor.com/api/dashboard/get-monthly-invoice",
+    sessionCookie
+  );
+
+  // Can't POST with fetchJson, so this might not work; just return existing
+  if (!invoice?.items) {
+    return existing;
+  }
+
+  const invoiceItems: Array<{ description: string; dollars: number }> = [];
+  for (const item of invoice.items) {
+    if (typeof item.cents !== "number" || item.description?.includes("Mid-month usage paid")) {
+      continue;
+    }
+    invoiceItems.push({
+      description: item.description ?? "",
+      dollars: item.cents / 100,
+    });
+  }
+  log(`[invoice] ${invoiceItems.length} 项账单明细`);
+
+  return {
+    ...existing,
+    invoiceItems: invoiceItems.length > 0 ? invoiceItems : existing.invoiceItems,
     updatedAt: new Date(),
   };
 }

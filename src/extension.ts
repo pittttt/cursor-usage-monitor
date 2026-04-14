@@ -1,58 +1,18 @@
 import * as vscode from "vscode";
-import { fetchCombinedUsage } from "./api";
+import { getValidAccessToken, fetchCoreUsage, fetchSupplementalUsage, initCacheDir } from "./api";
 import { UsageStatusBarItem } from "./statusBar";
 import { UsageTreeDataProvider } from "./usageView";
-
-const TOKEN_SECRET_KEY = "cursorUsageMonitor.token";
 
 let statusBarItem: UsageStatusBarItem | undefined;
 let treeDataProvider: UsageTreeDataProvider | undefined;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
-async function getToken(
-  context: vscode.ExtensionContext
-): Promise<string | undefined> {
-  return context.secrets.get(TOKEN_SECRET_KEY);
-}
+async function refresh(): Promise<void> {
+  const auth = getValidAccessToken();
 
-async function setToken(
-  context: vscode.ExtensionContext,
-  token: string
-): Promise<void> {
-  await context.secrets.store(TOKEN_SECRET_KEY, token);
-}
-
-async function promptForToken(context: vscode.ExtensionContext): Promise<boolean> {
-  const tokenGuide = [
-    "获取 Token 方法：",
-    "1. 在浏览器中登录 cursor.com",
-    '2. 打开开发者工具 → Application → Cookies',
-    '3. 找到 "WorkosCursorSessionToken" 的值',
-    "4. 复制完整的 Token 值粘贴到下方",
-  ].join("\n");
-
-  const token = await vscode.window.showInputBox({
-    title: "设置 Cursor Session Token",
-    prompt: tokenGuide,
-    placeHolder: "粘贴你的 WorkosCursorSessionToken 值",
-    password: true,
-    ignoreFocusOut: true,
-  });
-
-  if (token && token.trim()) {
-    await setToken(context, token.trim());
-    vscode.window.showInformationMessage("Cursor Token 已保存，正在获取用量数据...");
-    return true;
-  }
-  return false;
-}
-
-async function refresh(context: vscode.ExtensionContext): Promise<void> {
-  const token = await getToken(context);
-
-  if (!token) {
-    statusBarItem?.setNoToken();
-    treeDataProvider?.setError("未配置 Token，请先设置");
+  if (!auth) {
+    statusBarItem?.setError("无法读取 Token，请确认已登录 Cursor");
+    treeDataProvider?.setError("无法读取 Token，请确认已登录 Cursor");
     return;
   }
 
@@ -60,9 +20,15 @@ async function refresh(context: vscode.ExtensionContext): Promise<void> {
   treeDataProvider?.setLoading();
 
   try {
-    const data = await fetchCombinedUsage(token);
-    statusBarItem?.setData(data);
-    treeDataProvider?.setData(data);
+    const coreData = await fetchCoreUsage(auth.jwt, auth.sessionCookie);
+    statusBarItem?.setData(coreData);
+    treeDataProvider?.setData(coreData);
+
+    // Background: fetch invoice items
+    fetchSupplementalUsage(auth.sessionCookie, coreData).then((fullData) => {
+      statusBarItem?.setData(fullData);
+      treeDataProvider?.setData(fullData);
+    }).catch(() => {});
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     statusBarItem?.setError(message);
@@ -70,7 +36,7 @@ async function refresh(context: vscode.ExtensionContext): Promise<void> {
   }
 }
 
-function startAutoRefresh(context: vscode.ExtensionContext): void {
+function startAutoRefresh(): void {
   stopAutoRefresh();
 
   const config = vscode.workspace.getConfiguration("cursorUsageMonitor");
@@ -78,7 +44,7 @@ function startAutoRefresh(context: vscode.ExtensionContext): void {
   const intervalMs = intervalMinutes * 60 * 1000;
 
   refreshTimer = setInterval(() => {
-    refresh(context);
+    refresh();
   }, intervalMs);
 }
 
@@ -90,6 +56,8 @@ function stopAutoRefresh(): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  initCacheDir(context.globalStorageUri.fsPath);
+
   statusBarItem = new UsageStatusBarItem();
   context.subscriptions.push({ dispose: () => statusBarItem?.dispose() });
 
@@ -100,27 +68,20 @@ export function activate(context: vscode.ExtensionContext): void {
   });
   context.subscriptions.push(treeView);
 
-  const refreshCmd = vscode.commands.registerCommand(
-    "cursorUsageMonitor.refresh",
-    () => refresh(context)
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorUsageMonitor.refresh", () => refresh())
   );
-  context.subscriptions.push(refreshCmd);
 
-  const setTokenCmd = vscode.commands.registerCommand(
-    "cursorUsageMonitor.setToken",
-    async () => {
-      const saved = await promptForToken(context);
-      if (saved) {
-        refresh(context);
-        startAutoRefresh(context);
-      }
-    }
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorUsageMonitor.setToken", () => {
+      vscode.window.showInformationMessage(
+        "当前版本已支持自动读取 Token，无需手动设置。如显示异常，请确认已登录 Cursor。"
+      );
+    })
   );
-  context.subscriptions.push(setTokenCmd);
 
-  const setThresholdCmd = vscode.commands.registerCommand(
-    "cursorUsageMonitor.setThreshold",
-    async () => {
+  context.subscriptions.push(
+    vscode.commands.registerCommand("cursorUsageMonitor.setThreshold", async () => {
       const config = vscode.workspace.getConfiguration("cursorUsageMonitor");
       const current = config.get<number>("warningThreshold", 85);
 
@@ -141,38 +102,24 @@ export function activate(context: vscode.ExtensionContext): void {
       if (input !== undefined) {
         await config.update("warningThreshold", Number(input), vscode.ConfigurationTarget.Global);
         vscode.window.showInformationMessage(`告警阈值已设置为 ${input}%`);
-        refresh(context);
+        refresh();
       }
-    }
+    })
   );
-  context.subscriptions.push(setThresholdCmd);
 
-  const configListener = vscode.workspace.onDidChangeConfiguration((e) => {
-    if (e.affectsConfiguration("cursorUsageMonitor.refreshInterval")) {
-      startAutoRefresh(context);
-    }
-  });
-  context.subscriptions.push(configListener);
-
-  context.subscriptions.push({
-    dispose: () => stopAutoRefresh(),
-  });
-
-  // 启动时检查 token，无 token 则提示用户输入
-  getToken(context).then(async (token) => {
-    if (!token) {
-      statusBarItem?.setNoToken();
-      treeDataProvider?.setError("未配置 Token，请先设置");
-      const saved = await promptForToken(context);
-      if (saved) {
-        refresh(context);
-        startAutoRefresh(context);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("cursorUsageMonitor.refreshInterval")) {
+        startAutoRefresh();
       }
-    } else {
-      refresh(context);
-      startAutoRefresh(context);
-    }
-  });
+    })
+  );
+
+  context.subscriptions.push({ dispose: () => stopAutoRefresh() });
+
+  // Start immediately
+  refresh();
+  startAutoRefresh();
 }
 
 export function deactivate(): void {
