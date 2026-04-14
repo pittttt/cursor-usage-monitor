@@ -256,7 +256,8 @@ function parseSummary(summary: UsageSummary): CombinedUsageData {
   let monthlyLimitDollars = 0;
 
   const billingStart = summary.billingCycleStart ?? "";
-  const billingEnd = summary.billingCycleEnd ?? undefined;
+  const now = new Date();
+  const billingEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString();
 
   const individual = summary.individualUsage;
   if (individual) {
